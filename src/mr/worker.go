@@ -1,10 +1,16 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"time"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -13,6 +19,13 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -24,46 +37,113 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
+        logfileName := fmt.Sprintf("logfile-worker-%v", os.Getpid())
+	file, _ := os.OpenFile(logfileName, os.O_CREATE|os.O_RDWR, 0644)
+	log.SetOutput(file)
+	for {
+		reply := RpcRequestReply{}
+		arg := RpcRequestArgs{WorkerId: os.Getpid()}
+		ok := call("Coordinator.GetTask", &arg, &reply)
 
-	// Your worker implementation here.
+		if !ok || reply.Status == COORDINATOR_NONE {
+			log.Println("no tasks, sleep 1s")
+			time.Sleep(1 * time.Second)
+                        continue
+		}
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+		if reply.Status == COORDINATOR_DONE {
+			log.Println("all tasks have done, exit worker")
+			break
+		}
 
-}
+		// reply.Status == COORDINATOR_TASK
+		if reply.TaskType == TASK_MAP {
+			file, err := os.Open(reply.IntputFiles[0])
+			if err != nil {
+				log.Fatalf("cannot open %v", reply.IntputFiles[0])
+			}
+			content, err := ioutil.ReadAll(file)
+			file.Close()
 
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+			if err != nil {
+				log.Fatalf("cannot read %v", reply.IntputFiles[0])
+			}
+			kva := mapf(reply.IntputFiles[0], string(content))
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+			intermediate := make([][]KeyValue, reply.Num, reply.Num)
+			for _, kv := range kva {
+				i := ihash(kv.Key) % reply.Num
+				intermediate[i] = append(intermediate[i], kv)
+			}
 
-	// fill in the argument(s).
-	args.X = 99
+			for i, kvs := range intermediate {
+				filename := GetTaskOutputFilename(reply.TaskType, reply.TaskId, i)
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+				intermediateFile, _ := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0644)
+				enc := json.NewEncoder(intermediateFile)
 
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+				for _, kv := range kvs {
+					enc.Encode(&kv)
+				}
+				intermediateFile.Sync()
+				intermediateFile.Close()
+				log.Printf("write result to file %v\n", filename)
+			}
+		} else {
+			var kvs []KeyValue
+
+                        log.Println(reply.IntputFiles)
+			for _, filename := range reply.IntputFiles {
+				file, _ := os.Open(filename)
+				dec := json.NewDecoder(file)
+				for {
+					var kv KeyValue
+					if err := dec.Decode(&kv); err != nil {
+						break
+					}
+					kvs = append(kvs, kv)
+				}
+				file.Close()
+
+			}
+
+			sort.Sort(ByKey(kvs))
+
+			ofile, _ := os.OpenFile(GetTaskOutputFilename(TASK_REDUCE, reply.TaskId, 0), os.O_CREATE|os.O_RDWR, 0644)
+			i := 0
+			for i < len(kvs) {
+				j := i + 1
+				for j < len(kvs) && kvs[j].Key == kvs[i].Key {
+					j++
+				}
+				values := []string{}
+				for k := i; k < j; k++ {
+					values = append(values, kvs[k].Value)
+				}
+				output := reducef(kvs[i].Key, values)
+
+				fmt.Fprintf(ofile, "%v %v\n", kvs[i].Key, output)
+
+				i = j
+			}
+			ofile.Sync()
+			ofile.Close()
+		}
+
+		log.Printf("task %v done!", reply.TaskId)
+
+		responseArg := RpcResponseArgs{}
+		responseReply := RpcResponseReply{}
+
+		responseArg.WorkerId = os.Getpid()
+		responseArg.Status = TASK_STATUS_DONE
+		responseArg.TaskId = reply.TaskId
+		call("Coordinator.TaskDone", &responseArg, &responseReply)
 	}
 }
 
